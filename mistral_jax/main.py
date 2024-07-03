@@ -29,6 +29,7 @@ config = {
     "head_dim": 128,
     "hidden_dim": 14336,
     "n_heads": 32,
+    "max_seq_len": 4096,
     "n_kv_heads": 8,
     "norm_eps": 1e-05,
     "vocab_size": 32000,
@@ -37,6 +38,7 @@ config = {
 }
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> jnp.ndarray:
+    print(dim)
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(end)
     freqs_LD = jnp.outer(t, freqs).astype(jnp.float32)
@@ -50,7 +52,9 @@ def apply_rotary_emb(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     def rotate(x_BLHK):
         x1_BLHK, x2_BLHK = jnp.split(x_BLHK, 2, axis=-1)
-        freqs_cos_LK, freqs_sin_LK = jnp.split(freqs_cis_LK2, 2, axis=-1)
+        freqs_cos_LK1, freqs_sin_LK1 = jnp.split(freqs_cis_LK2, 2, axis=-1)
+        freqs_cos_LK = freqs_cos_LK1.squeeze(axis=2)
+        freqs_sin_LK = freqs_sin_LK1.squeeze(axis=2)
 
         freqs_cos_LK = freqs_cos_LK[:x_BLHK.shape[1]]  # trim to seq length
         freqs_sin_LK = freqs_sin_LK[:x_BLHK.shape[1]]  # trim to seq length
@@ -223,13 +227,10 @@ def load_model(model_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return params, config
 
 def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, prompt: str, max_new_tokens: int = 20, temperature: float = 0.7) -> str:
-    # Tokenize the prompt
     input_ids_L = tokenizer.encode(prompt, return_tensors="jax").squeeze()
 
-    # Initialize the model's state
-    x_BL = input_ids_L[None, :]  # Add batch dimension explicitly
+    x_BL = input_ids_L[None, :]
 
-    # Precompute freqs_cis for the entire possible length
     max_seq_len = config['sliding_window']
     freqs_cis_LK2 = precompute_freqs_cis(
         config['head_dim'],
@@ -237,53 +238,36 @@ def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, pro
         config['rope_theta']
     )
 
-    # Generate tokens
     for _ in range(max_new_tokens):
-        # Ensure x doesn't exceed the model's context length
         x_BL = x_BL[:, -config['sliding_window']:]
 
-        # Forward pass through the model
         logits_BLV = transformer(params, x_BL, freqs_cis_LK2[:x_BL.shape[1]], config)
 
-        # Get the logits for the last token
         next_token_logits_V = logits_BLV[0, -1]  # Remove batch dimension
 
-        # Apply temperature
         next_token_logits_V = next_token_logits_V / temperature
 
-        # Sample the next token
         next_token = jax.random.categorical(jax.random.PRNGKey(int(time.time())), next_token_logits_V)
 
-        # Append the new token to the sequence
         x_BL = jnp.concatenate([x_BL, next_token[None, None]], axis=1)
 
-        # If we've generated an EOS token, stop
         if next_token == tokenizer.eos_token_id:
             break
 
-    # Decode the generated sequence
     generated_text = tokenizer.decode(x_BL[0, len(input_ids_L):], skip_special_tokens=True)
 
     return generated_text
 
 
 if __name__ == "__main__":
-    # Set up paths and configurations
     model_path = "../sagasu/mistral-7B-v0.2/"
 
-    # Load the model and configuration
     print("Loading model...")
     params, config = load_model(model_path)
 
-    # Update or add necessary configuration parameters
-    config['max_seq_len'] = 4096  # Update this to match the model's max sequence length
-    config['rope_theta'] = 1000000.0  # Make sure this matches the value used during training
-
-    # Initialize tokenizer
     print("Initializing tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 
-    # Test text generation
     print("Generating text...")
     prompts = [
         "Once upon a time in a land far, far away,",
@@ -303,7 +287,6 @@ if __name__ == "__main__":
 
     print("\nTesting complete!")
 
-    # Interactive mode
     print("\nEntering interactive mode. Type 'exit' to quit.")
     while True:
         user_prompt = input("\nEnter your prompt: ")
