@@ -10,6 +10,19 @@ import torch
 from jax import random
 from transformers import AutoTokenizer
 
+"""
+Dimension key:
+
+B: batch size
+L: sequence length
+M: memory length (length of sequence being attended to)
+D: model dimension (sometimes called d_model or embedding_dim)
+V: vocabulary size
+F: feed-forward subnetwork hidden size
+H: number of attention heads in a layer
+K: size of each attention key or value (sometimes called d_kv)
+"""
+
 config = {
     "dim": 4096,
     "n_layers": 32,
@@ -26,122 +39,111 @@ config = {
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(end)
-    freqs = jnp.outer(t, freqs).astype(jnp.float32)
-    cos = jnp.cos(freqs)
-    sin = jnp.sin(freqs)
-    return jnp.stack([cos, sin], axis=-1)
+    freqs_LD = jnp.outer(t, freqs).astype(jnp.float32)
+    cos_LD, sin_LD = jnp.cos(freqs_LD), jnp.sin(freqs_LD)
+    return jnp.stack([cos_LD, sin_LD], axis=-1)
 
 def apply_rotary_emb(
-    xq: jnp.ndarray,
-    xk: jnp.ndarray,
-    freqs_cis: jnp.ndarray
+    xq_BLHK: jnp.ndarray,
+    xk_BLHK: jnp.ndarray,
+    freqs_cis_LK2: jnp.ndarray
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    def rotate(x):
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        freqs_cos, freqs_sin = jnp.split(freqs_cis, 2, axis=-1)
+    def rotate(x_BLHK):
+        x1_BLHK, x2_BLHK = jnp.split(x_BLHK, 2, axis=-1)
+        freqs_cos_LK, freqs_sin_LK = jnp.split(freqs_cis_LK2, 2, axis=-1)
 
-        print(x1.shape)
-        print(freqs_cos.shape)
-        freqs_cos = freqs_cos[:x.shape[1]]  # trim to seq length
-        freqs_sin = freqs_sin[:x.shape[1]]  # trim to seq length
+        freqs_cos_LK = freqs_cos_LK[:x_BLHK.shape[1]]  # trim to seq length
+        freqs_sin_LK = freqs_sin_LK[:x_BLHK.shape[1]]  # trim to seq length
 
-        freqs_cos = jnp.expand_dims(freqs_cos, axis=(0, 2))
-        freqs_sin = jnp.expand_dims(freqs_sin, axis=(0, 2))
-
+        freqs_cos_1L1K = jnp.expand_dims(freqs_cos_LK, axis=(0, 2))
+        freqs_sin_1L1K = jnp.expand_dims(freqs_sin_LK, axis=(0, 2))
 
         return jnp.concatenate([
-            x1 * freqs_cos - x2 * freqs_sin,
-            x1 * freqs_sin + x2 * freqs_cos
+            x1_BLHK * freqs_cos_1L1K - x2_BLHK * freqs_sin_1L1K,
+            x1_BLHK * freqs_sin_1L1K + x2_BLHK * freqs_cos_1L1K
         ], axis=-1)
 
-    return rotate(xq), rotate(xk)
+    return rotate(xq_BLHK), rotate(xk_BLHK)
 
 def repeat_kv(
-    keys: jnp.ndarray, values: jnp.ndarray, repeats: int, dim: int
+    keys_BLHK: jnp.ndarray, values_BLHK: jnp.ndarray, repeats: int, dim: int
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    keys = jnp.repeat(keys, repeats=repeats, axis=dim)
-    values = jnp.repeat(values, repeats=repeats, axis=dim)
-    return keys, values
+    keys_BLHK = jnp.repeat(keys_BLHK, repeats=repeats, axis=dim)
+    values_BLHK = jnp.repeat(values_BLHK, repeats=repeats, axis=dim)
+    return keys_BLHK, values_BLHK
 
 def create_mask(batch_size: int, seqlen: int, sliding_window: int) -> jnp.ndarray:
-    mask = jnp.tril(jnp.ones((seqlen, seqlen), dtype=bool))
+    mask_LL = jnp.tril(jnp.ones((seqlen, seqlen), dtype=bool))
 
     if sliding_window is not None and sliding_window < seqlen:
-        window_mask = jnp.triu(jnp.ones((seqlen, seqlen), dtype=bool), k=-sliding_window)
-        mask = jnp.logical_and(mask, window_mask)
+        window_mask_LL = jnp.triu(jnp.ones((seqlen, seqlen), dtype=bool), k=-sliding_window)
+        mask_LL = jnp.logical_and(mask_LL, window_mask_LL)
 
-    return jnp.repeat(mask[jnp.newaxis, :, :], batch_size, axis=0)
+    return jnp.repeat(mask_LL[jnp.newaxis, :, :], batch_size, axis=0)
 
-def mha(queries: jnp.ndarray, keys: jnp.ndarray, values: jnp.ndarray, mask: jnp.ndarray, config: Dict[str, Any]):
+def mha(queries_BLHK: jnp.ndarray, keys_BLHK: jnp.ndarray, values_BLHK: jnp.ndarray, mask_BLL: jnp.ndarray, config: Dict[str, Any]):
     head_dim = config['head_dim']
-    scores = jnp.einsum('bnhqd,bnhkd->bnhqk', queries, keys)
-    scores = scores / (head_dim ** 0.5)
+    scores_BHLM = jnp.einsum('blhk,bmhk->bhlm', queries_BLHK, keys_BLHK)
+    scores_BHLM = scores_BHLM / (head_dim ** 0.5)
 
-    scores = jnp.where(mask[:, jnp.newaxis, :, :], scores, jnp.finfo(scores.dtype).min)
+    scores_BHLM = jnp.where(mask_BLL[:, jnp.newaxis, :, :], scores_BHLM, jnp.finfo(scores_BHLM.dtype).min)
 
-    scores = jax.nn.softmax(scores, axis=-1)
-    output = jnp.einsum('bnhqk,bnhkd->bnhqd', scores, values)
-    return output
+    scores_BHLM = jax.nn.softmax(scores_BHLM, axis=-1)
+    output_BLHK = jnp.einsum('bhlm,bmhk->blhk', scores_BHLM, values_BLHK)
+    return output_BLHK
 
-def gqa(x: jnp.ndarray, wq, wk, wv, wo, freqs_cis: jnp.ndarray, config: Dict[str, Any]):
-    batch_size, seqlen_sum, _ = x.shape
+def gqa(x_BLD: jnp.ndarray, wq_DHK, wk_DHK, wv_DHK, wo_HDK, freqs_cis_LK2: jnp.ndarray, config: Dict[str, Any]):
+    batch_size, seqlen_sum, _ = x_BLD.shape
     n_heads, n_kv_heads, head_dim = config['n_heads'], config['n_kv_heads'], config['head_dim']
 
     assert n_heads % n_kv_heads == 0
 
-    queries, keys, values = x @ wq, x @ wk, x @ wv
+    queries_BLHK, keys_BLHK, values_BLHK = x_BLD @ wq_DHK, x_BLD @ wk_DHK, x_BLD @ wv_DHK
 
-    queries = queries.reshape(batch_size, seqlen_sum, n_heads, head_dim)
-    keys = keys.reshape(batch_size, seqlen_sum, n_kv_heads, head_dim)
-    values = values.reshape(batch_size, seqlen_sum, n_kv_heads, head_dim)
+    queries_BLHK = queries_BLHK.reshape(batch_size, seqlen_sum, n_heads, head_dim)
+    keys_BLHK = keys_BLHK.reshape(batch_size, seqlen_sum, n_kv_heads, head_dim)
+    values_BLHK = values_BLHK.reshape(batch_size, seqlen_sum, n_kv_heads, head_dim)
 
-    queries, keys = apply_rotary_emb(queries, keys, freqs_cis)
+    queries_BLHK, keys_BLHK = apply_rotary_emb(queries_BLHK, keys_BLHK, freqs_cis_LK2)
 
     repeats = n_heads // n_kv_heads
-    keys, values = repeat_kv(keys, values, repeats, dim=2)
+    keys_BLHK, values_BLHK = repeat_kv(keys_BLHK, values_BLHK, repeats, dim=2)
 
-    mask = create_mask(batch_size, seqlen_sum, config['sliding_window'])
-    output = mha(queries, keys, values, mask, config)
+    mask_BLL = create_mask(batch_size, seqlen_sum, config['sliding_window'])
+    output_BLHK = mha(queries_BLHK, keys_BLHK, values_BLHK, mask_BLL, config)
 
-    output = output.reshape(batch_size, seqlen_sum, n_heads * head_dim)
-    output = output @ wo
+    output_BLD = output_BLHK.reshape(batch_size, seqlen_sum, n_heads * head_dim)
+    output_BLD = output_BLD @ wo_HDK
 
-    return output
+    return output_BLD
 
-def ffn(x: jnp.ndarray, w1: jnp.ndarray, w2: jnp.ndarray, w3: jnp.ndarray) -> jnp.ndarray:
-    return jnp.einsum('bsd,dh->bsh', jax.nn.silu(jnp.einsum('bsd,dh->bsh', x, w1)) * jnp.einsum('bsd,dh->bsh', x, w3), w2)
+def ffn(x_BLD: jnp.ndarray, w1_DF: jnp.ndarray, w2_FD: jnp.ndarray, w3_DF: jnp.ndarray) -> jnp.ndarray:
+    return jnp.einsum('bsd,dh->bsh', jax.nn.silu(jnp.einsum('bsd,dh->bsh', x_BLD, w1_DF)) * jnp.einsum('bsd,dh->bsh', x_BLD, w3_DF), w2_FD)
 
-def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
-    ms = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-    x_normed = x * jax.lax.rsqrt(ms + eps)
-    return x_normed * weight
+def rms_norm(x_BLD: jnp.ndarray, weight_D: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    ms_B1D = jnp.mean(jnp.square(x_BLD), axis=-1, keepdims=True)
+    x_normed_BLD = x_BLD * jax.lax.rsqrt(ms_B1D + eps)
+    return x_normed_BLD * weight_D
 
-
-
-def transformer(params: Dict[str, Any], x: jnp.ndarray, freqs_cis: jnp.ndarray, config: Dict[str, Any]) -> jnp.ndarray:
-    x = params['token_embedding'][x]
+def transformer(params: Dict[str, Any], x_BL: jnp.ndarray, freqs_cis_LK2: jnp.ndarray, config: Dict[str, Any]) -> jnp.ndarray:
+    x_BLD = params['token_embedding_VD'][x_BL]
 
     for layer_params in params['layers']:
-        h = rms_norm(x, layer_params['attention_norm'])
-        h = gqa(h, layer_params['attention_wq'], layer_params['attention_wk'],
-                layer_params['attention_wv'], layer_params['attention_wo'], freqs_cis, config)
-        h = x + h
-        x = rms_norm(h, layer_params['ffn_norm'])
-        h = ffn(x, layer_params['ffn_w1'], layer_params['ffn_w2'], layer_params['ffn_w3'])
-        x = x + h
+        h_BLD = rms_norm(x_BLD, layer_params['attention_norm_D'])
+        h_BLD = gqa(h_BLD, layer_params['attention_wq_DHK'], layer_params['attention_wk_DHK'],
+                layer_params['attention_wv_DHK'], layer_params['attention_wo_HDK'], freqs_cis_LK2, config)
+        h_BLD = x_BLD + h_BLD
+        x_BLD = rms_norm(h_BLD, layer_params['ffn_norm_D'])
+        h_BLD = ffn(x_BLD, layer_params['ffn_w1_DF'], layer_params['ffn_w2_FD'], layer_params['ffn_w3_DF'])
+        x_BLD = x_BLD + h_BLD
 
-    x = rms_norm(x, params['norm'])
-    return x @ params['output']
-
+    x_BLD = rms_norm(x_BLD, params['norm_D'])
+    return x_BLD @ params['output_DV']
 
 def init_params(config: Dict[str, Any], key: jnp.ndarray) -> Dict[str, Any]:
-    dim = config['dim']
-    n_heads = config['n_heads']
-    n_kv_heads = config['n_kv_heads']
-    head_dim = config['head_dim']
-    hidden_dim = config['hidden_dim']
-    vocab_size = config['vocab_size']
-    n_layers = config['n_layers']
+    dim, n_heads, n_kv_heads = config['dim'], config['n_heads'], config['n_kv_heads']
+    head_dim, hidden_dim = config['head_dim'], config['hidden_dim']
+    vocab_size, n_layers = config['vocab_size'], config['n_layers']
 
     def init_weight(key, shape):
         return random.normal(key, shape) * 0.02
@@ -149,27 +151,26 @@ def init_params(config: Dict[str, Any], key: jnp.ndarray) -> Dict[str, Any]:
     params = {}
     key, *subkeys = random.split(key, n_layers * 13 + 4)
 
-    params['token_embedding'] = init_weight(subkeys[0], (vocab_size, dim))
-    params['norm'] = init_weight(subkeys[1], (dim,))
-    params['output'] = init_weight(subkeys[2], (dim, vocab_size))
+    params['token_embedding_VD'] = init_weight(subkeys[0], (vocab_size, dim))
+    params['norm_D'] = init_weight(subkeys[1], (dim,))
+    params['output_DV'] = init_weight(subkeys[2], (dim, vocab_size))
 
     params['layers'] = []
 
     for i in range(n_layers):
         layer_params = {}
-        layer_params['attention_norm'] = init_weight(subkeys[i*13+3], (dim,))
-        layer_params['attention_wq'] = init_weight(subkeys[i*13+4], (dim, n_heads * head_dim))
-        layer_params['attention_wk'] = init_weight(subkeys[i*13+5], (dim, n_kv_heads * head_dim))
-        layer_params['attention_wv'] = init_weight(subkeys[i*13+6], (dim, n_kv_heads * head_dim))
-        layer_params['attention_wo'] = init_weight(subkeys[i*13+7], (n_heads * head_dim, dim))
-        layer_params['ffn_norm'] = init_weight(subkeys[i*13+8], (dim,))
-        layer_params['ffn_w1'] = init_weight(subkeys[i*13+9], (hidden_dim, dim))
-        layer_params['ffn_w2'] = init_weight(subkeys[i*13+10], (dim, hidden_dim))
-        layer_params['ffn_w3'] = init_weight(subkeys[i*13+11], (hidden_dim, dim))
+        layer_params['attention_norm_D'] = init_weight(subkeys[i*13+3], (dim,))
+        layer_params['attention_wq_DHK'] = init_weight(subkeys[i*13+4], (dim, n_heads * head_dim))
+        layer_params['attention_wk_DHK'] = init_weight(subkeys[i*13+5], (dim, n_kv_heads * head_dim))
+        layer_params['attention_wv_DHK'] = init_weight(subkeys[i*13+6], (dim, n_kv_heads * head_dim))
+        layer_params['attention_wo_HDK'] = init_weight(subkeys[i*13+7], (n_heads * head_dim, dim))
+        layer_params['ffn_norm_D'] = init_weight(subkeys[i*13+8], (dim,))
+        layer_params['ffn_w1_DF'] = init_weight(subkeys[i*13+9], (hidden_dim, dim))
+        layer_params['ffn_w2_FD'] = init_weight(subkeys[i*13+10], (dim, hidden_dim))
+        layer_params['ffn_w3_DF'] = init_weight(subkeys[i*13+11], (hidden_dim, dim))
         params['layers'].append(layer_params)
 
     return params
-
 
 def load_model(model_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     with open(Path(model_path) / "params.json", "r") as f:
@@ -189,61 +190,48 @@ def load_model(model_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             parts = k.split('.')
             layer_num = int(parts[1])
 
-            # Ensure we have enough layers in our params
             while len(params['layers']) <= layer_num:
                 params['layers'].append({})
 
             layer_params = params['layers'][layer_num]
 
             if 'attention_norm.weight' in k:
-                layer_params['attention_norm'] = jnp.array(torch_to_numpy(v))
-                assert layer_params['attention_norm'].shape == (config['dim'],)
+                layer_params['attention_norm_D'] = jnp.array(torch_to_numpy(v))
             elif 'ffn_norm.weight' in k:
-                layer_params['ffn_norm'] = jnp.array(torch_to_numpy(v))
-                assert layer_params['ffn_norm'].shape == (config['dim'],)
+                layer_params['ffn_norm_D'] = jnp.array(torch_to_numpy(v))
             elif 'attention.wq.weight' in k:
-                layer_params['attention_wq'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['attention_wq'].shape == (config['dim'], config['n_heads'] * config['head_dim'])
+                layer_params['attention_wq_DHK'] = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wk.weight' in k:
-                layer_params['attention_wk'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['attention_wk'].shape == (config['dim'], config['n_kv_heads'] * config['head_dim'])
+                layer_params['attention_wk_DHK'] = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wv.weight' in k:
-                layer_params['attention_wv'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['attention_wv'].shape == (config['dim'], config['n_kv_heads'] * config['head_dim'])
+                layer_params['attention_wv_DHK'] = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wo.weight' in k:
-                layer_params['attention_wo'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['attention_wo'].shape == (config['n_heads'] * config['head_dim'], config['dim'])
+                layer_params['attention_wo_HDK'] = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w1.weight' in k:
-                layer_params['ffn_w1'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['ffn_w1'].shape == (config['dim'], config['hidden_dim'])
+                layer_params['ffn_w1_DF'] = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w2.weight' in k:
-                layer_params['ffn_w2'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['ffn_w2'].shape == (config['hidden_dim'], config['dim'])
+                layer_params['ffn_w2_FD'] = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w3.weight' in k:
-                layer_params['ffn_w3'] = jnp.array(torch_to_numpy(v)).T
-                assert layer_params['ffn_w3'].shape == (config['dim'], config['hidden_dim'])
+                layer_params['ffn_w3_DF'] = jnp.array(torch_to_numpy(v)).T
         elif 'tok_embeddings.weight' in k:
-            params['token_embedding'] = jnp.array(torch_to_numpy(v))
-            assert params['token_embedding'].shape == (config['vocab_size'], config['dim'])
+            params['token_embedding_VD'] = jnp.array(torch_to_numpy(v))
         elif 'norm.weight' in k:
-            params['norm'] = jnp.array(torch_to_numpy(v))
-            assert params['norm'].shape == (config['dim'],)
+            params['norm_D'] = jnp.array(torch_to_numpy(v))
         elif 'output.weight' in k:
-            params['output'] = jnp.array(torch_to_numpy(v)).T
-            assert params['output'].shape == (config['dim'], config['vocab_size'])
+            params['output_DV'] = jnp.array(torch_to_numpy(v)).T
 
     return params, config
 
 def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, prompt: str, max_new_tokens: int = 20, temperature: float = 0.7) -> str:
     # Tokenize the prompt
-    input_ids = tokenizer.encode(prompt, return_tensors="jax").squeeze()
+    input_ids_L = tokenizer.encode(prompt, return_tensors="jax").squeeze()
 
     # Initialize the model's state
-    x = input_ids[None, :]  # Add batch dimension explicitly
+    x_BL = input_ids_L[None, :]  # Add batch dimension explicitly
 
     # Precompute freqs_cis for the entire possible length
     max_seq_len = config['sliding_window']
-    freqs_cis = precompute_freqs_cis(
+    freqs_cis_LK2 = precompute_freqs_cis(
         config['head_dim'],
         max_seq_len,
         config['rope_theta']
@@ -252,29 +240,29 @@ def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, pro
     # Generate tokens
     for _ in range(max_new_tokens):
         # Ensure x doesn't exceed the model's context length
-        x = x[:, -config['sliding_window']:]
+        x_BL = x_BL[:, -config['sliding_window']:]
 
         # Forward pass through the model
-        logits = transformer(params, x, freqs_cis[:x.shape[1]], config)
+        logits_BLV = transformer(params, x_BL, freqs_cis_LK2[:x_BL.shape[1]], config)
 
         # Get the logits for the last token
-        next_token_logits = logits[0, -1]  # Remove batch dimension
+        next_token_logits_V = logits_BLV[0, -1]  # Remove batch dimension
 
         # Apply temperature
-        next_token_logits = next_token_logits / temperature
+        next_token_logits_V = next_token_logits_V / temperature
 
         # Sample the next token
-        next_token = jax.random.categorical(jax.random.PRNGKey(int(time.time())), next_token_logits)
+        next_token = jax.random.categorical(jax.random.PRNGKey(int(time.time())), next_token_logits_V)
 
         # Append the new token to the sequence
-        x = jnp.concatenate([x, next_token[None, None]], axis=1)
+        x_BL = jnp.concatenate([x_BL, next_token[None, None]], axis=1)
 
         # If we've generated an EOS token, stop
         if next_token == tokenizer.eos_token_id:
             break
 
     # Decode the generated sequence
-    generated_text = tokenizer.decode(x[0, len(input_ids):], skip_special_tokens=True)
+    generated_text = tokenizer.decode(x_BL[0, len(input_ids_L):], skip_special_tokens=True)
 
     return generated_text
 
