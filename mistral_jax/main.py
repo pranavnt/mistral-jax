@@ -37,35 +37,44 @@ config = {
     "sliding_window": 32768
 }
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> jnp.ndarray:
-    print(dim)
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(end)
-    freqs_LD = jnp.outer(t, freqs).astype(jnp.float32)
-    cos_LD, sin_LD = jnp.cos(freqs_LD), jnp.sin(freqs_LD)
-    return jnp.stack([cos_LD, sin_LD], axis=-1)
+def compute_freqs_cis(dim: int, max_pos: int, theta: float = 10000.0) -> jnp.ndarray:
+    inv_freq = 1.0 / (
+        theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim)
+    )
+    t = jnp.arange(0, max_pos)
+    freqs = jnp.outer(t, inv_freq)
+    freqs_cis = (jnp.cos(freqs), jnp.sin(freqs))
+    return freqs_cis
+
+
+# def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> jnp.ndarray:
+#     print(dim)
+#     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
+#     t = jnp.arange(end)
+#     freqs_LD = jnp.outer(t, freqs).astype(jnp.float32)
+#     cos_LD, sin_LD = jnp.cos(freqs_LD), jnp.sin(freqs_LD)
+#     return jnp.stack([cos_LD, sin_LD], axis=-1)
 
 def apply_rotary_emb(
     xq_BLHK: jnp.ndarray,
     xk_BLHK: jnp.ndarray,
-    freqs_cis_LK2: jnp.ndarray
+    freqs_cis_LK2: tuple[jnp.ndarray, jnp.ndarray]
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    freqs_cos_LK, freqs_sin_LK = freqs_cis_LK2
+
     def rotate(x_BLHK):
+        B, L, H, K = x_BLHK.shape
         x1_BLHK, x2_BLHK = jnp.split(x_BLHK, 2, axis=-1)
-        freqs_cos_LK1, freqs_sin_LK1 = jnp.split(freqs_cis_LK2, 2, axis=-1)
-        freqs_cos_LK = freqs_cos_LK1.squeeze(axis=2)
-        freqs_sin_LK = freqs_sin_LK1.squeeze(axis=2)
+        K2 = K // 2
 
-        freqs_cos_LK = freqs_cos_LK[:x_BLHK.shape[1]]  # trim to seq length
-        freqs_sin_LK = freqs_sin_LK[:x_BLHK.shape[1]]  # trim to seq length
+        freqs_cos = freqs_cos_LK[:L, :K2].reshape(1, L, 1, K2)
+        freqs_sin = freqs_sin_LK[:L, :K2].reshape(1, L, 1, K2)
 
-        freqs_cos_1L1K = jnp.expand_dims(freqs_cos_LK, axis=(0, 2))
-        freqs_sin_1L1K = jnp.expand_dims(freqs_sin_LK, axis=(0, 2))
+        pos_embed_1 = x1_BLHK * freqs_cos - x2_BLHK * freqs_sin
+        pos_embed_2 = x1_BLHK * freqs_sin + x2_BLHK * freqs_cos
 
-        return jnp.concatenate([
-            x1_BLHK * freqs_cos_1L1K - x2_BLHK * freqs_sin_1L1K,
-            x1_BLHK * freqs_sin_1L1K + x2_BLHK * freqs_cos_1L1K
-        ], axis=-1)
+        pos_embed = jnp.concatenate([pos_embed_1, pos_embed_2], axis=-1)
+        return pos_embed
 
     return rotate(xq_BLHK), rotate(xk_BLHK)
 
@@ -232,7 +241,7 @@ def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, pro
     x_BL = input_ids_L[None, :]
 
     max_seq_len = config['sliding_window']
-    freqs_cis_LK2 = precompute_freqs_cis(
+    freqs_cis_LK2 = compute_freqs_cis(
         config['head_dim'],
         max_seq_len,
         config['rope_theta']
@@ -243,7 +252,7 @@ def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, pro
 
         logits_BLV = transformer(params, x_BL, freqs_cis_LK2[:x_BL.shape[1]], config)
 
-        next_token_logits_V = logits_BLV[0, -1]  # Remove batch dimension
+        next_token_logits_V = logits_BLV[0, -1]
 
         next_token_logits_V = next_token_logits_V / temperature
 
