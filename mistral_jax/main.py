@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 import time
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,10 @@ import numpy as np
 import torch
 from jax import random
 from transformers import AutoTokenizer
+from dataclasses import dataclass
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 """
 Dimension key:
@@ -22,6 +27,26 @@ F: feed-forward subnetwork hidden size
 H: number of attention heads in a layer
 K: size of each attention key or value (sometimes called d_kv)
 """
+
+@dataclass
+class BlockWeights:
+    attention_wq_DHK: jnp.ndarray
+    attention_wk_DHK: jnp.ndarray
+    attention_wv_DHK: jnp.ndarray
+    attention_wo_HDK: jnp.ndarray
+    attention_norm_D: jnp.ndarray
+    ffn_w1_DF: jnp.ndarray
+    ffn_w2_FD: jnp.ndarray
+    ffn_w3_DF: jnp.ndarray
+    ffn_norm_D: jnp.ndarray
+
+@dataclass
+class TransformerWeights:
+    token_embedding_VD: jnp.ndarray
+    layers: List[BlockWeights]
+    norm_D: jnp.ndarray
+    output_DV: jnp.ndarray
+
 
 config = {
     "dim": 4096,
@@ -138,20 +163,20 @@ def rms_norm(x_BLD: jnp.ndarray, weight_D: jnp.ndarray, eps: float = 1e-6) -> jn
     x_normed_BLD = x_BLD * jax.lax.rsqrt(ms_B1D + eps)
     return x_normed_BLD * weight_D
 
-def transformer(params: Dict[str, Any], x_BL: jnp.ndarray, freqs_cis_LK2: jnp.ndarray, config: Dict[str, Any]) -> jnp.ndarray:
-    x_BLD = params['token_embedding_VD'][x_BL]
+def transformer(params: TransformerWeights, x_BL: jnp.ndarray, freqs_cis_LK2: jnp.ndarray, config: Dict[str, Any]) -> jnp.ndarray:
+    x_BLD = params.token_embedding_VD[x_BL]
 
-    for layer_params in params['layers']:
-        h_BLD = rms_norm(x_BLD, layer_params['attention_norm_D'])
-        h_BLD = gqa(h_BLD, layer_params['attention_wq_DHK'], layer_params['attention_wk_DHK'],
-                layer_params['attention_wv_DHK'], layer_params['attention_wo_HDK'], freqs_cis_LK2, config)
+    for layer_params in params.layers:
+        h_BLD = rms_norm(x_BLD, layer_params.attention_norm_D)
+        h_BLD = gqa(h_BLD, layer_params.attention_wq_DHK, layer_params.attention_wk_DHK,
+                layer_params.attention_wv_DHK, layer_params.attention_wo_HDK, freqs_cis_LK2, config)
         h_BLD = x_BLD + h_BLD
-        x_BLD = rms_norm(h_BLD, layer_params['ffn_norm_D'])
-        h_BLD = ffn(x_BLD, layer_params['ffn_w1_DF'], layer_params['ffn_w2_FD'], layer_params['ffn_w3_DF'])
+        x_BLD = rms_norm(h_BLD, layer_params.ffn_norm_D)
+        h_BLD = ffn(x_BLD, layer_params.ffn_w1_DF, layer_params.ffn_w2_FD, layer_params.ffn_w3_DF)
         x_BLD = x_BLD + h_BLD
 
-    x_BLD = rms_norm(x_BLD, params['norm_D'])
-    return x_BLD @ params['output_DV']
+    x_BLD = rms_norm(x_BLD, params.norm_D)
+    return x_BLD @ params.output_DV
 
 def init_params(config: Dict[str, Any], key: jnp.ndarray) -> Dict[str, Any]:
     dim, n_heads, n_kv_heads = config['dim'], config['n_heads'], config['n_kv_heads']
@@ -185,13 +210,14 @@ def init_params(config: Dict[str, Any], key: jnp.ndarray) -> Dict[str, Any]:
 
     return params
 
-def load_model(model_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def load_model(model_path: str) -> Tuple[TransformerWeights, Dict[str, Any]]:
     with open(Path(model_path) / "params.json", "r") as f:
         config = json.load(f)
 
-    params = {
-        'layers': []
-    }
+    layers = []
+    token_embedding_VD = None
+    norm_D = None
+    output_DV = None
 
     state_dict = torch.load(str(Path(model_path) / "consolidated.00.pth"), map_location='cpu')
 
@@ -199,43 +225,61 @@ def load_model(model_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         return np.array(t.cpu().to(torch.float32).detach().numpy())
 
     for k, v in state_dict.items():
+        logger.info(f"Loading weight: {k} with shape {v.shape}")
         if 'layers' in k:
             parts = k.split('.')
             layer_num = int(parts[1])
 
-            while len(params['layers']) <= layer_num:
-                params['layers'].append({})
+            while len(layers) <= layer_num:
+                layers.append(BlockWeights(
+                    attention_wq_DHK=None,
+                    attention_wk_DHK=None,
+                    attention_wv_DHK=None,
+                    attention_wo_HDK=None,
+                    attention_norm_D=None,
+                    ffn_w1_DF=None,
+                    ffn_w2_FD=None,
+                    ffn_w3_DF=None,
+                    ffn_norm_D=None
+                ))
 
-            layer_params = params['layers'][layer_num]
+            layer_params = layers[layer_num]
 
             if 'attention_norm.weight' in k:
-                layer_params['attention_norm_D'] = jnp.array(torch_to_numpy(v))
+                layer_params.attention_norm_D = jnp.array(torch_to_numpy(v))
             elif 'ffn_norm.weight' in k:
-                layer_params['ffn_norm_D'] = jnp.array(torch_to_numpy(v))
+                layer_params.ffn_norm_D = jnp.array(torch_to_numpy(v))
             elif 'attention.wq.weight' in k:
-                layer_params['attention_wq_DHK'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.attention_wq_DHK = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wk.weight' in k:
-                layer_params['attention_wk_DHK'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.attention_wk_DHK = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wv.weight' in k:
-                layer_params['attention_wv_DHK'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.attention_wv_DHK = jnp.array(torch_to_numpy(v)).T
             elif 'attention.wo.weight' in k:
-                layer_params['attention_wo_HDK'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.attention_wo_HDK = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w1.weight' in k:
-                layer_params['ffn_w1_DF'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.ffn_w1_DF = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w2.weight' in k:
-                layer_params['ffn_w2_FD'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.ffn_w2_FD = jnp.array(torch_to_numpy(v)).T
             elif 'feed_forward.w3.weight' in k:
-                layer_params['ffn_w3_DF'] = jnp.array(torch_to_numpy(v)).T
+                layer_params.ffn_w3_DF = jnp.array(torch_to_numpy(v)).T
         elif 'tok_embeddings.weight' in k:
-            params['token_embedding_VD'] = jnp.array(torch_to_numpy(v))
+            token_embedding_VD = jnp.array(torch_to_numpy(v))
         elif 'norm.weight' in k:
-            params['norm_D'] = jnp.array(torch_to_numpy(v))
+            norm_D = jnp.array(torch_to_numpy(v))
         elif 'output.weight' in k:
-            params['output_DV'] = jnp.array(torch_to_numpy(v)).T
+            output_DV = jnp.array(torch_to_numpy(v)).T
+
+    params = TransformerWeights(
+        token_embedding_VD=token_embedding_VD,
+        layers=layers,
+        norm_D=norm_D,
+        output_DV=output_DV
+    )
 
     return params, config
 
-def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, prompt: str, max_new_tokens: int = 20, temperature: float = 0.7) -> str:
+def generate(params: TransformerWeights, config: Dict[str, Any], tokenizer: Any, prompt: str, max_new_tokens: int = 20, temperature: float = 0.7) -> str:
     input_ids_L = tokenizer.encode(prompt, return_tensors="jax").squeeze()
 
     x_BL = input_ids_L[None, :]
@@ -266,7 +310,6 @@ def generate(params: Dict[str, Any], config: Dict[str, Any], tokenizer: Any, pro
     generated_text = tokenizer.decode(x_BL[0, len(input_ids_L):], skip_special_tokens=True)
 
     return generated_text
-
 
 if __name__ == "__main__":
     model_path = "../sagasu/mistral-7B-v0.2/"
