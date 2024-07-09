@@ -137,55 +137,43 @@ def rms_norm(x_BLD: jnp.ndarray, weight_D: jnp.ndarray, eps: float = 1e-6) -> jn
 def restructure_layer_weights(layer_weights):
     return jax.tree.map(lambda *arrays: jnp.stack(arrays), *layer_weights)
 
-def apply_layer(h_BLD: jnp.ndarray, layer_weights, freqs_cis_LK2: jnp.ndarray,
-                head_dim: int, n_heads: int, n_kv_heads: int, sliding_window: int) -> jnp.ndarray:
-    # Attention
-    h_BLD_attn = rms_norm(h_BLD, layer_weights.attention_norm_D)
-    h_BLD_attn = gqa(h_BLD_attn,
-                     layer_weights.attention_wq_DHK,
-                     layer_weights.attention_wk_DHK,
-                     layer_weights.attention_wv_DHK,
-                     layer_weights.attention_wo_HDK,
-                     freqs_cis_LK2,
-                     head_dim, n_heads, n_kv_heads, sliding_window)
-    h_BLD = h_BLD + h_BLD_attn
-
-    # Feed-forward
-    h_BLD_ffn = rms_norm(h_BLD, layer_weights.ffn_norm_D)
-    h_BLD_ffn = ffn(h_BLD_ffn,
-                    layer_weights.ffn_w1_DF,
-                    layer_weights.ffn_w2_FD,
-                    layer_weights.ffn_w3_DF)
-    h_BLD = h_BLD + h_BLD_ffn
-
-    return h_BLD
-
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
 def transformer(params: TransformerWeights, x: jnp.ndarray, freqs_cis_LK2: Tuple[jnp.ndarray, jnp.ndarray],
                 head_dim: int, n_heads: int, n_kv_heads: int, sliding_window: int,
                 max_seq_len: int) -> jnp.ndarray:
-    h = params.token_embedding_VD[x]
+        h = params.token_embedding_VD[x]
 
-    def scan_fn(h_BLD, layer_weights):
-        h = apply_layer(h_BLD, layer_weights, freqs_cis_LK2,
-                        head_dim, n_heads, n_kv_heads, sliding_window)
-        return h, None
+        def scan_fn(h_BLD, layer_weights):
+            h_BLD_attn = rms_norm(h_BLD, layer_weights.attention_norm_D)
+            h_BLD_attn = gqa(h_BLD_attn,
+                layer_weights.attention_wq_DHK,
+                layer_weights.attention_wk_DHK,
+                layer_weights.attention_wv_DHK,
+                layer_weights.attention_wo_HDK,
+                freqs_cis_LK2,
+            head_dim, n_heads, n_kv_heads, sliding_window)
+            h_BLD = h_BLD + h_BLD_attn
 
-    h, _ = jax.lax.scan(scan_fn, h, params.layer_weights)
-    h = rms_norm(h, params.norm_D)
-    return h @ params.output_DV
+            h_BLD_ffn = rms_norm(h_BLD, layer_weights.ffn_norm_D)
+            h_BLD_ffn = ffn(h_BLD_ffn,
+                layer_weights.ffn_w1_DF,
+                layer_weights.ffn_w2_FD,
+                layer_weights.ffn_w3_DF)
+            h_BLD = h_BLD + h_BLD_ffn
+
+            return h_BLD, None
+
+        h, _ = jax.lax.scan(scan_fn, h, params.layer_weights)
+        h = rms_norm(h, params.norm_D)
+        return h @ params.output_DV
 
 def generate(params: TransformerWeights, config: Dict[str, Any], tokenizer: Any, prompt: str, max_new_tokens: int = 20, temperature: float = 0.7) -> str:
     input_ids = tokenizer.encode(prompt, return_tensors="jax").squeeze()
     x = input_ids[None, :]
 
-    max_seq_len = config['sliding_window']
-    freqs_cis = compute_freqs_cis(config['head_dim'], max_seq_len, config['rope_theta'])
+    max_seq_len, head_dim, rope_theta, sliding_window, n_heads, n_kv_heads = config['max_seq_len'], config['head_dim'], config['rope_theta'], config['sliding_window'], config['n_heads'], config['n_kv_heads']
 
-    head_dim = config['head_dim']
-    n_heads = config['n_heads']
-    n_kv_heads = config['n_kv_heads']
-    sliding_window = config['sliding_window']
+    freqs_cis = compute_freqs_cis(head_dim, max_seq_len, rope_theta)
 
     for _ in range(max_new_tokens):
         x = x[:, -sliding_window:]
@@ -282,27 +270,20 @@ def load_model(model_path: str) -> Tuple[TransformerWeights, Dict[str, Any]]:
 if __name__ == "__main__":
     model_path = "./mistral-7B-v0.3/"
 
-    print("Loading model...")
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.3")
     params, config = load_model(model_path)
 
-    print("Initializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.3")
-
-    print("Generating text...")
     prompts = [
         "Who is Barack Obama?",
     ]
 
-    for i, prompt in enumerate(prompts, 1):
-        print(f"\nTest {i}:")
+    for prompt in prompts:
         print(f"Prompt: {prompt}")
 
         output = generate(params, config, tokenizer, prompt, max_new_tokens=10, temperature=1.0)
 
         print(f"Generated text: {output}")
         print("-" * 50)
-
-    print("\nTesting complete!")
 
     print("\nEntering interactive mode. Type 'exit' to quit.")
     while True:
@@ -312,5 +293,3 @@ if __name__ == "__main__":
 
         output = generate(params, config, tokenizer, user_prompt, max_new_tokens=10, temperature=0.7)
         print(f"\nGenerated text: {output}")
-
-    print("Thank you for using the language model. Goodbye!")
