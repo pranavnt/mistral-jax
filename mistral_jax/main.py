@@ -286,7 +286,7 @@ def load_model(model_path: str) -> Tuple[TransformerWeights, Dict[str, Any]]:
     return params, config
 
 if __name__ == "__main__":
-    model_path = "../sagasu/mistral-7B-v0.2/"
+    model_path = "./mistral-7B-v0.3/"
 
     print("Loading model...")
     params, config = load_model(model_path)
