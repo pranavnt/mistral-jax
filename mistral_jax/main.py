@@ -40,6 +40,7 @@ class TransformerWeights(NamedTuple):
     norm_D: jnp.ndarray
     output_DV: jnp.ndarray
 
+# code for pos embeds is from https://github.com/AakashKumarNain/mistral_jax/blob/main/mistral_jax/rope.py
 def compute_freqs_cis(dim: int, max_pos: int, theta: float = 10000.0) -> jnp.ndarray:
     inv_freq = 1.0 / (
         theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim)
