@@ -1,20 +1,14 @@
-import json
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any, NamedTuple
+from typing import List, Tuple, Dict, Any, NamedTuple
 import time
-import logging
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from jax import random
 from transformers import AutoTokenizer
-from dataclasses import dataclass
 from functools import partial
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from safetensors import safe_open
 
 """
 Dimension key:
@@ -46,37 +40,14 @@ class TransformerWeights(NamedTuple):
     norm_D: jnp.ndarray
     output_DV: jnp.ndarray
 
-config = {
-    "dim": 4096,
-    "n_layers": 32,
-    "head_dim": 128,
-    "hidden_dim": 14336,
-    "n_heads": 32,
-    "max_seq_len": 4096,
-    "n_kv_heads": 8,
-    "norm_eps": 1e-05,
-    "vocab_size": 32000,
-    "rope_theta": 1000000.0,
-    "sliding_window": 32768
-}
-
 def compute_freqs_cis(dim: int, max_pos: int, theta: float = 10000.0) -> jnp.ndarray:
     inv_freq = 1.0 / (
         theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim)
     )
     t = jnp.arange(0, max_pos)
-    freqs = jnp.outer(t, inv_freq)
-    freqs_cis = (jnp.cos(freqs), jnp.sin(freqs))
+    freqs_LD = jnp.outer(t, inv_freq)
+    freqs_cis = (jnp.cos(freqs_LD), jnp.sin(freqs_LD))
     return freqs_cis
-
-
-# def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> jnp.ndarray:
-#     print(dim)
-#     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-#     t = jnp.arange(end)
-#     freqs_LD = jnp.outer(t, freqs).astype(jnp.float32)
-#     cos_LD, sin_LD = jnp.cos(freqs_LD), jnp.sin(freqs_LD)
-#     return jnp.stack([cos_LD, sin_LD], axis=-1)
 
 def apply_rotary_emb(
     xq_BLHK: jnp.ndarray,
@@ -195,8 +166,8 @@ def transformer(params: TransformerWeights, x: jnp.ndarray, freqs_cis_LK2: Tuple
                 max_seq_len: int) -> jnp.ndarray:
     h = params.token_embedding_VD[x]
 
-    def scan_fn(carry, layer_weights):
-        h = apply_layer(carry, layer_weights, freqs_cis_LK2,
+    def scan_fn(h_BLD, layer_weights):
+        h = apply_layer(h_BLD, layer_weights, freqs_cis_LK2,
                         head_dim, n_heads, n_kv_heads, sliding_window)
         return h, None
 
@@ -229,13 +200,35 @@ def generate(params: TransformerWeights, config: Dict[str, Any], tokenizer: Any,
     return tokenizer.decode(x[0, len(input_ids):], skip_special_tokens=True)
 
 def load_model(model_path: str) -> Tuple[TransformerWeights, Dict[str, Any]]:
-    with open(Path(model_path) / "params.json", "r") as f:
-        config = json.load(f)
-
     layers = []
     token_embedding_VD = norm_D = output_DV = None
 
-    state_dict = torch.load(str(Path(model_path) / "consolidated.00.pth"), map_location='cpu')
+    config = {
+        "dim": 4096,
+        "n_layers": 32,
+        "head_dim": 128,
+        "hidden_dim": 14336,
+        "n_heads": 32,
+        "max_seq_len": 4096,
+        "n_kv_heads": 8,
+        "norm_eps": 1e-05,
+        "vocab_size": 32000,
+        "rope_theta": 1000000.0,
+        "sliding_window": 32768
+    }
+
+    safetensors_path = Path(model_path) / "consolidated.safetensors"
+    pytorch_path = Path(model_path) / "consolidated.00.pth"
+
+    if safetensors_path.exists():
+        print("Loading from safetensors file...")
+        with safe_open(str(safetensors_path), framework="pt", device="cpu") as f:
+            state_dict = {k: f.get_tensor(k) for k in f.keys()}
+    elif pytorch_path.exists():
+        print("Loading from PyTorch file...")
+        state_dict = torch.load(str(pytorch_path), map_location='cpu')
+    else:
+        raise FileNotFoundError("Neither safetensors nor PyTorch model file found.")
 
     def torch_to_numpy(t):
         return np.array(t.cpu().to(torch.float32).detach().numpy())
@@ -285,6 +278,7 @@ def load_model(model_path: str) -> Tuple[TransformerWeights, Dict[str, Any]]:
 
     return params, config
 
+
 if __name__ == "__main__":
     model_path = "./mistral-7B-v0.3/"
 
@@ -292,21 +286,18 @@ if __name__ == "__main__":
     params, config = load_model(model_path)
 
     print("Initializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.3")
 
     print("Generating text...")
     prompts = [
-        "Once upon a time in a land far, far away,",
-        "The solution to climate change is",
-        "In the year 2050, artificial intelligence has",
-        "The most important scientific discovery of the 21st century is"
+        "Who is Barack Obama?",
     ]
 
     for i, prompt in enumerate(prompts, 1):
         print(f"\nTest {i}:")
         print(f"Prompt: {prompt}")
 
-        output = generate(params, config, tokenizer, prompt, max_new_tokens=10, temperature=0.7)
+        output = generate(params, config, tokenizer, prompt, max_new_tokens=10, temperature=1.0)
 
         print(f"Generated text: {output}")
         print("-" * 50)
@@ -319,7 +310,7 @@ if __name__ == "__main__":
         if user_prompt.lower() == 'exit':
             break
 
-        output = generate(params, config, tokenizer, user_prompt, max_new_tokens=100, temperature=0.7)
+        output = generate(params, config, tokenizer, user_prompt, max_new_tokens=10, temperature=0.7)
         print(f"\nGenerated text: {output}")
 
     print("Thank you for using the language model. Goodbye!")
